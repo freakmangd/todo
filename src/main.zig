@@ -1,11 +1,9 @@
 const timestamp_format = "YYYY-MM-DD HH:mm:ss z";
 
-pub fn main() !void {
-    var dba: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = dba.deinit();
-    const gpa = dba.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
 
-    var args = try std.process.argsWithAllocator(gpa);
+    var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
 
     _ = args.skip();
@@ -31,16 +29,16 @@ pub fn main() !void {
             .init => {
                 const name = try expectNextArg(&args, "name");
 
-                const cwd = std.fs.cwd();
+                const cwd = std.Io.Dir.cwd();
 
-                var todo_dir = try cwd.makeOpenPath(".todo", .{});
-                defer todo_dir.close();
+                var todo_dir = try cwd.createDirPathOpen(init.io, ".todo", .{});
+                defer todo_dir.close(init.io);
 
-                const config_file = try todo_dir.createFile("config.zon", .{});
-                defer config_file.close();
+                const config_file = try todo_dir.createFile(init.io, "config.zon", .{});
+                defer config_file.close(init.io);
 
                 var buf: [2048]u8 = undefined;
-                var fw = config_file.writer(&buf);
+                var fw = config_file.writer(init.io, &buf);
 
                 try fw.interface.print(
                     \\.{{
@@ -52,23 +50,23 @@ pub fn main() !void {
             .add => {
                 const name = try expectNextArg(&args, "name");
 
-                var todo_dir = findTodoDir(std.fs.cwd(), .{}) catch |err| {
+                var todo_dir = findTodoDir(init.io, std.Io.Dir.cwd(), .{}) catch |err| {
                     std.log.err("cannot find todo dir: {t}", .{err});
                     return error.CannotFindTodoDir;
                 };
-                defer todo_dir.close();
+                defer todo_dir.close(init.io);
 
-                var todo_file = todo_dir.createFile(name, .{ .exclusive = true }) catch |err| switch (err) {
+                var todo_file = todo_dir.createFile(init.io, name, .{ .exclusive = true }) catch |err| switch (err) {
                     error.PathAlreadyExists => {
                         std.log.err("'{s}' already exists", .{name});
                         return error.TodoAlreadyExists;
                     },
                     else => |e| return e,
                 };
-                defer todo_file.close();
+                defer todo_file.close(init.io);
 
                 var buf: [2048]u8 = undefined;
-                var fw = todo_file.writer(&buf);
+                var fw = todo_file.writer(init.io, &buf);
 
                 try fw.interface.writeAll("created: ");
 
@@ -79,7 +77,7 @@ pub fn main() !void {
             },
             .list => {
                 var buf: [2048]u8 = undefined;
-                var stdout = std.fs.File.stdout().writer(&buf);
+                var stdout = std.Io.File.stdout().writer(&buf);
 
                 var todo_dir = try findTodoDir(std.fs.cwd(), .{ .iterate = true });
                 defer todo_dir.close();
@@ -141,26 +139,26 @@ pub fn main() !void {
     }
 }
 
-fn findTodoDir(cwd: std.fs.Dir, open_dir_options: std.fs.Dir.OpenOptions) !std.fs.Dir {
+fn findTodoDir(io: std.Io, cwd: std.Io.Dir, open_dir_options: std.Io.Dir.OpenOptions) !std.Io.Dir {
     var cur = cwd;
 
-    const todo_dir: std.fs.Dir = todo_dir: while (true) {
-        break :todo_dir cur.openDir(".todo", open_dir_options) catch {
-            const parent = try cur.openDir("..", .{});
-            cur.close();
+    const todo_dir: std.Io.Dir = todo_dir: while (true) {
+        break :todo_dir cur.openDir(io, ".todo", open_dir_options) catch {
+            const parent = try cur.openDir(io, "..", .{});
+            cur.close(io);
             cur = parent;
             continue;
         };
     };
 
-    if (todo_dir.access("config.zon", .{})) |_| {} else |_| {
+    if (todo_dir.access(io, "config.zon", .{})) |_| {} else |_| {
         return error.MalformedTodoDir;
     }
 
     return todo_dir;
 }
 
-fn expectNextArg(args: *std.process.ArgIterator, name: []const u8) ![]const u8 {
+fn expectNextArg(args: *std.process.Args.Iterator, name: []const u8) ![]const u8 {
     return args.next() orelse {
         std.log.err("Not enough arguments, missing '{s}'", .{name});
         return error.NotEnoughArguments;
