@@ -10,9 +10,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const zig_time_dep = b.dependency("zig-time", .{});
-    mod.addImport("zig-time", zig_time_dep.module("zig-time"));
-
     const exe = b.addExecutable(.{
         .name = "todo",
         .root_module = mod,

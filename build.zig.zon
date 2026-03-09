@@ -1,12 +1,7 @@
 .{
     .name = .todo,
     .version = "0.0.1",
-    .dependencies = .{
-        .@"zig-time" = .{
-            .url = "git+https://github.com/deatil/zig-time?ref=main#5c62c666350da909019f91f682471e14ba6fbc3f",
-            .hash = "zig_time-1.2.0-FD_-ClelAQB4hP6Tf3zIp3csi91UlUuO55dak6gbaXh8",
-        },
-    },
+    .dependencies = .{},
     .minimum_zig_version = "0.15.2",
     .paths = .{""},
     .fingerprint = 0x5a0eb6a039c11be7,
