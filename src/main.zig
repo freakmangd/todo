@@ -20,14 +20,22 @@ const Command = enum {
     help,
     init,
     add,
+    a,
     remove,
+    rm,
     status,
+    stat,
     list,
+    ls,
     start,
+    on,
     stop,
+    off,
     complete,
+    done,
     uncomplete,
     notes,
+    n,
     repair,
 };
 
@@ -78,7 +86,6 @@ pub fn mainInner(init: std.process.Init) !void {
     defer todo_dir.close(io);
 
     var config = try Config.read(arena, io, todo_dir);
-    defer config.deinit(arena);
 
     //std.debug.print("{f}\n", .{config});
 
@@ -90,28 +97,32 @@ pub fn mainInner(init: std.process.Init) !void {
 
             try stdout.interface.writeAll(
                 \\todo
-                \\    help                  - show this dialogue
-                \\    init <name>           - create a .todo dir in the current directory named <name>
-                \\    list                  - list todo items
-                \\        -a   - list all details
-                \\        -h   - list history
+                \\  help                      show this dialogue
+                \\  init <name>               create a .todo dir in the current directory named <name>
+                \\  list, ls                  list todo items
+                \\                              -a    list all details
+                \\                              -h    list history
+                \\  repair                    try to repair .todo dir
                 \\
-                \\    add <name|id>         - add a todo item
-                \\        -m   - add a message to the notes file
-                \\    remove <name|id>      - remove todo item
-                \\    status <name|id>      - print the status of an item
-                \\        -a   - list all details
-                \\        -h   - list history
-                \\    start <name|id>       - start working on a todo item
-                \\    stop <name|id>        - stop working on a todo item
-                \\    complete <name|id>    - complete a todo item
-                \\    notes <name|id>       - print todo item's notes
-                \\        -p   - print the path to the notes file. ex: `todo notes 9d -p | xargs nvim`
+                \\  add, a <name|id>          add a todo item
+                \\                              -m    add a message to the notes file
+                \\  remove, rm <name|id>      remove todo item
+                \\                              -y    don't ask for confirmation
+                \\  status, stat <name|id>    print the status of an item
+                \\                              -a    list all details
+                \\                              -h    list history
+                \\  start, on <name|id>       start working on a todo item
+                \\  stop, off <name|id>       stop working on a todo item
+                \\  complete, done <name|id>  complete a todo item
+                \\  uncomplete <name|id>      uncomplete a todo item
+                \\  notes, n <name|id>        print todo item's notes
+                \\                              -p    print the path to the notes file. 
+                \\                                    ex: `todo notes 9d -p | xargs nvim`
                 \\
             );
             try stdout.flush();
         },
-        .add => {
+        .add, .a => {
             var rand_bytes: [4]u8 = undefined;
             io.random(&rand_bytes);
             const hex = std.fmt.bytesToHex(rand_bytes, .lower);
@@ -119,26 +130,31 @@ pub fn mainInner(init: std.process.Init) !void {
             const args = try consumeArgs(&args_iter, AddArgs);
             try cmdAdd(arena, io, args, &config, todo_dir, hex);
         },
-        .remove => {
+        .remove, .rm => {
             const args = try consumeArgs(&args_iter, RemoveArgs);
             try cmdRemove(io, args, &config, todo_dir);
         },
-        .status => {
+        .status, .stat => {
             const args = try consumeArgs(&args_iter, StatusArgs);
             try cmdStatus(io, args, config, todo_dir);
         },
-        .list => {
+        .list, .ls => {
             var stdout_buf: [2048]u8 = undefined;
             var stdout = Io.File.stdout().writer(io, &stdout_buf);
 
             const args = try consumeArgs(&args_iter, ListArgs);
             try cmdList(io, args, config, todo_dir, &stdout.interface);
         },
-        .start, .stop => {
+        .start, .stop, .on, .off => {
+            const com: Command = switch (command) {
+                .start, .on => .start,
+                .stop, .off => .stop,
+                else => unreachable,
+            };
             const args = try consumeArgs(&args_iter, StartStopArgs);
-            try cmdStartStop(io, args, config, todo_dir, command);
+            try cmdStartStop(io, args, config, todo_dir, com);
         },
-        .complete => {
+        .complete, .done => {
             const args = try consumeArgs(&args_iter, CompleteArgs);
             try cmdComplete(arena, io, args, &config, todo_dir);
         },
@@ -146,7 +162,7 @@ pub fn mainInner(init: std.process.Init) !void {
             const args = try consumeArgs(&args_iter, UncompleteArgs);
             try cmdUncomplete(io, args, &config, todo_dir);
         },
-        .notes => {
+        .notes, .n => {
             var stdout_buf: [2048]u8 = undefined;
             var stdout = Io.File.stdout().writer(io, &stdout_buf);
 
