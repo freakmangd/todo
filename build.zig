@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("c", libc.createModule());
 
     const exe = b.addExecutable(.{
-        .name = "todo",
+        .name = "tak",
         .root_module = mod,
     });
 

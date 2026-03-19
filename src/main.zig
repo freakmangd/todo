@@ -37,6 +37,9 @@ const Command = enum {
     notes,
     n,
     repair,
+
+    install_completions,
+    completions,
 };
 
 pub fn main(init: std.process.Init) if (@import("builtin").mode == .Debug) anyerror!void else void {
@@ -60,41 +63,52 @@ pub fn mainInner(init: std.process.Init) !void {
     var args_iter = try init.minimal.args.iterateAllocator(arena);
     defer args_iter.deinit();
 
-    _ = args_iter.skip();
+    const exe_path = args_iter.next();
+    _ = &exe_path;
 
-    const first_arg = args_iter.next() orelse "help";
+    const first_arg = args_iter.next() orelse arg: {
+        // running without args
+        var todo_dir = findTodoDir(io, .{}) catch break :arg "help";
+        defer todo_dir.close(io);
+
+        const config = try Config.read(arena, io, todo_dir);
+
+        var stdout_buf: [2048]u8 = undefined;
+        var stdout = Io.File.stdout().writer(io, &stdout_buf);
+
+        const args = try consumeArgs(&args_iter, ListArgs);
+        try cmdList(io, args, config, todo_dir, &stdout.interface);
+
+        return;
+    };
+
     const command = std.meta.stringToEnum(Command, first_arg) orelse {
-        std.log.err("{s} is not a recognized command", .{first_arg});
+        stat_id: {
+            // try interpreting as an id and stat it
+            var todo_dir = findTodoDir(io, .{}) catch break :stat_id;
+            defer todo_dir.close(io);
+
+            const config = try Config.read(arena, io, todo_dir);
+
+            var stdout_buf: [2048]u8 = undefined;
+            var stdout = Io.File.stdout().writer(io, &stdout_buf);
+
+            var args = try consumeArgs(&args_iter, StatusArgs);
+            args.inner.pos[0] = first_arg;
+            args.args_len = 1;
+            try cmdStatus(io, args, config, todo_dir, &stdout.interface);
+            return;
+        }
+
+        std.log.err("'{s}' is not a recognized command", .{first_arg});
         return error.UnexpectedArgument;
     };
 
-    switch (command) {
-        .init => {
-            const args = try consumeArgs(&args_iter, InitArgs);
-            try cmdInit(io, args, Dir.cwd());
-            return;
-        },
-        else => {},
-    }
-
-    var path: Io.Writer.Allocating = try .initCapacity(arena, 2);
-    defer path.deinit();
-
-    try path.writer.writeAll("\"");
-
-    var todo_dir = try findTodoDirWithPath(io, .{ .iterate = true }, &path.writer);
-    defer todo_dir.close(io);
-
-    var config = try Config.read(arena, io, todo_dir);
-
-    //std.debug.print("{f}\n", .{config});
+    var buf: [2048]u8 = undefined;
+    var stdout = Io.File.stdout().writer(io, &buf);
 
     switch (command) {
-        .init => unreachable,
         .help => {
-            var buf: [2048]u8 = undefined;
-            var stdout = Io.File.stdout().writer(io, &buf);
-
             try stdout.interface.writeAll(
                 \\todo
                 \\  help                      show this dialogue
@@ -121,27 +135,47 @@ pub fn mainInner(init: std.process.Init) !void {
                 \\
             );
             try stdout.flush();
+            return;
         },
+        .init => {
+            const args = try consumeArgs(&args_iter, InitArgs);
+            try cmdInit(io, args, Dir.cwd());
+            return;
+        },
+        else => {},
+    }
+
+    var path: Io.Writer.Allocating = try .initCapacity(arena, 2);
+    defer path.deinit();
+
+    try path.writer.writeAll("\"");
+
+    var todo_dir = try findTodoDirWithPath(io, .{ .iterate = true }, &path.writer);
+    defer todo_dir.close(io);
+
+    var config = try Config.read(arena, io, todo_dir);
+
+    //std.debug.print("{f}\n", .{config});
+
+    switch (command) {
+        .init, .help => unreachable,
         .add, .a => {
             var rand_bytes: [4]u8 = undefined;
             io.random(&rand_bytes);
             const hex = std.fmt.bytesToHex(rand_bytes, .lower);
 
             const args = try consumeArgs(&args_iter, AddArgs);
-            try cmdAdd(arena, io, args, &config, todo_dir, hex);
+            try cmdAdd(arena, io, args, &config, todo_dir, hex, &buf);
         },
         .remove, .rm => {
             const args = try consumeArgs(&args_iter, RemoveArgs);
-            try cmdRemove(io, args, &config, todo_dir);
+            try cmdRemove(io, args, &config, todo_dir, &buf);
         },
         .status, .stat => {
             const args = try consumeArgs(&args_iter, StatusArgs);
-            try cmdStatus(io, args, config, todo_dir);
+            try cmdStatus(io, args, config, todo_dir, &stdout.interface);
         },
         .list, .ls => {
-            var stdout_buf: [2048]u8 = undefined;
-            var stdout = Io.File.stdout().writer(io, &stdout_buf);
-
             const args = try consumeArgs(&args_iter, ListArgs);
             try cmdList(io, args, config, todo_dir, &stdout.interface);
         },
@@ -152,28 +186,64 @@ pub fn mainInner(init: std.process.Init) !void {
                 else => unreachable,
             };
             const args = try consumeArgs(&args_iter, StartStopArgs);
-            try cmdStartStop(io, args, config, todo_dir, com);
+            try cmdStartStop(io, args, config, todo_dir, com, &buf);
         },
         .complete, .done => {
             const args = try consumeArgs(&args_iter, CompleteArgs);
-            try cmdComplete(arena, io, args, &config, todo_dir);
+            try cmdComplete(arena, io, args, &config, todo_dir, &buf);
         },
         .uncomplete => {
             const args = try consumeArgs(&args_iter, UncompleteArgs);
-            try cmdUncomplete(io, args, &config, todo_dir);
+            try cmdUncomplete(io, args, &config, todo_dir, &buf);
         },
         .notes, .n => {
-            var stdout_buf: [2048]u8 = undefined;
-            var stdout = Io.File.stdout().writer(io, &stdout_buf);
-
             const args = try consumeArgs(&args_iter, NotesArgs);
             try cmdNotes(io, args, config, todo_dir, &path, &stdout.interface);
         },
         .repair => {
-            try cmdRepair(arena, io, &config, todo_dir);
+            try cmdRepair(arena, io, &config, todo_dir, &stdout.interface);
+        },
+        .install_completions => {
+            const args = try consumeArgs(&args_iter, struct {
+                pos: [1][]const u8,
+            });
+            const shell = std.meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
+                std.log.err("unsupported shell for completions :(", .{});
+                return error.UnsupportedShell;
+            };
+
+            switch (shell) {
+                .bash => try stdout.interface.writeAll(@embedFile("completions.bash")),
+                .zsh => try stdout.interface.writeAll(@embedFile("completions.zsh")),
+                .fish => try stdout.interface.writeAll(@embedFile("completions.fish")),
+            }
+            try stdout.flush();
+            return;
+        },
+        .completions => {
+            const args = try consumeArgs(&args_iter, struct {
+                pos: [1][]const u8,
+            });
+            const shell = std.meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
+                std.log.err("unsupported shell for completions :(", .{});
+                return error.UnsupportedShell;
+            };
+
+            switch (shell) {
+                .bash => {},
+                .zsh => {
+                    for (config.items.keys(), config.items.values()) |k, v| {
+                        try stdout.interface.print("{s}:{s}\n", .{ k, v.name() });
+                    }
+                },
+                .fish => {},
+            }
+            try stdout.flush();
+            return;
         },
     }
 
+    // TODO: maybe only write if config is dirty?
     try config.write(io, todo_dir);
 }
 
@@ -209,13 +279,11 @@ const AddArgs = struct {
     m: ?[]const u8,
 };
 
-fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Config, todo_dir: Dir, key: [8]u8) !void {
+fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Config, todo_dir: Dir, key: [8]u8, buf: []u8) !void {
     const now: std.Io.Timestamp = .now(io, .real);
 
     const name = args.posOrFatal(0, "name");
-
-    var buf: [2048]u8 = undefined;
-    const name_with_ext = try arena.dupe(u8, nameWithExt(name, ".todo", &buf));
+    const name_with_ext = try arena.dupe(u8, nameWithExt(name, ".todo", buf));
 
     try config.items.put(arena, key, .{ .path = name_with_ext });
 
@@ -229,17 +297,17 @@ fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Co
     defer todo_file.close(io);
 
     {
-        var fw = todo_file.writer(io, &buf);
+        var fw = todo_file.writer(io, buf);
         try fw.interface.print("{t}: {d}", .{ Status.created, now });
         try fw.flush();
     }
 
     if (args.inner.m) |msg| {
-        const notes_path = nameWithExt(name, ".md", &buf);
+        const notes_path = nameWithExt(name, ".md", buf);
         var notes_file = try todo_dir.createFile(io, notes_path, .{});
         defer notes_file.close(io);
 
-        var fw = notes_file.writer(io, &buf);
+        var fw = notes_file.writer(io, buf);
         try fw.interface.print("{s}", .{msg});
         try fw.flush();
     }
@@ -250,7 +318,7 @@ const RemoveArgs = struct {
     y: bool,
 };
 
-fn cmdRemove(io: Io, args: WrapArgs(RemoveArgs), config: *Config, todo_dir: Dir) !void {
+fn cmdRemove(io: Io, args: WrapArgs(RemoveArgs), config: *Config, todo_dir: Dir, buf: []u8) !void {
     const name = args.posOrFatal(0, "name");
 
     if (std.mem.eql(u8, name, "config.json")) {
@@ -260,15 +328,10 @@ fn cmdRemove(io: Io, args: WrapArgs(RemoveArgs), config: *Config, todo_dir: Dir)
 
     const item = config.getItemOrFatal(name);
 
-    var buf: [2048]u8 = undefined;
-    var stdin = Io.File.stdin().reader(io, &buf);
-
-    if (!args.inner.y) {
+    const should_delete = args.inner.y or should_delete: {
+        var stdin = Io.File.stdin().reader(io, buf);
         var stdout = Io.File.stdout().writer(io, &.{});
         try stdout.interface.print("Are you sure you would like to remove '{s}'? (y/n): ", .{name});
-    }
-
-    const should_delete = args.inner.y or should_delete: {
         const input = try stdin.interface.takeDelimiter('\n') orelse break :should_delete false;
         break :should_delete input.len == 1 and std.ascii.toLower(input[0]) == 'y';
     };
@@ -292,7 +355,7 @@ const StatusArgs = struct {
     pos: [1][]const u8,
 };
 
-fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir) !void {
+fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir, stdout: *Io.Writer) !void {
     const name = args.posOrFatal(0, "name");
     const item = config.getItemOrFatal(name);
 
@@ -302,9 +365,7 @@ fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir) 
     var read_buf: [2048]u8 = undefined;
     const item_status = try item_file.getLastStatus(io, item.value, &read_buf);
 
-    var buf: [2048]u8 = undefined;
-    var stdout = Io.File.stdout().writer(io, &buf);
-    try stdout.interface.print(
+    try stdout.print(
         \\on todo list {s}
         \\{f}
         \\
@@ -318,7 +379,7 @@ fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir) 
     } });
 
     if (args.inner.h) {
-        try item_file.formatItemStatus(io, &stdout.interface);
+        try item_file.formatItemStatus(io, stdout);
     }
 
     try stdout.flush();
@@ -362,17 +423,35 @@ fn cmdList(io: Io, args: WrapArgs(ListArgs), config: Config, todo_dir: Dir, stdo
 
 const StartStopArgs = struct {
     pos: [1][]const u8,
+    a: bool,
 };
 
-fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir: Dir, command: Command) !void {
+fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir: Dir, command: Command, buf: []u8) !void {
+    if (args.inner.a) {
+        if (command != .stop) {
+            std.log.err("-a is only for 'stop'", .{});
+            return error.InvalidFlag;
+        }
+
+        for (config.items.values()) |v| {
+            var f = try v.openFile(io, todo_dir, .{ .mode = .read_write });
+            const last = f.getLastStatus(io, v, buf) catch continue;
+
+            if (last.status == .started) {
+                try f.addStatus(io, .stopped, buf);
+            }
+        }
+
+        return;
+    }
+
     const name = args.posOrFatal(0, "name");
     const item = config.getItemOrFatal(name);
 
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    var buf: [2048]u8 = undefined;
-    const last_status = try item_file.getLastStatus(io, item.value, &buf);
+    const last_status = try item_file.getLastStatus(io, item.value, buf);
     if (last_status.status == .restart) {
         std.log.err("{s} is completed, use 'uncomplete' to allow the item to be started", .{name});
     } else if (last_status.status == .started and command == .start) {
@@ -385,22 +464,21 @@ fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir:
         .start => .started,
         .stop => .stopped,
         else => unreachable,
-    }, &buf);
+    }, buf);
 }
 
 const CompleteArgs = struct {
     pos: [1][]const u8,
 };
 
-fn cmdComplete(arena: std.mem.Allocator, io: Io, args: WrapArgs(CompleteArgs), config: *Config, todo_dir: Dir) !void {
+fn cmdComplete(arena: std.mem.Allocator, io: Io, args: WrapArgs(CompleteArgs), config: *Config, todo_dir: Dir, buf: []u8) !void {
     const name = args.posOrFatal(0, "name");
     const item = config.getItemOrFatal(name);
 
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    var buf: [2048]u8 = undefined;
-    const last_status = try item_file.getLastStatus(io, item.value, &buf);
+    const last_status = try item_file.getLastStatus(io, item.value, buf);
     if (last_status.status == .finishd) {
         std.log.err("{s} is already completed", .{name});
     }
@@ -408,12 +486,12 @@ fn cmdComplete(arena: std.mem.Allocator, io: Io, args: WrapArgs(CompleteArgs), c
     const complete_dir = try todo_dir.openDir(io, "completed", .{});
     defer complete_dir.close(io);
 
-    try item_file.addStatus(io, .finishd, &buf);
+    try item_file.addStatus(io, .finishd, buf);
     try config.items.put(arena, item.key, .{ .path = try std.fmt.allocPrint(arena, "completed/{s}", .{item.value.path}) });
 
     try todo_dir.rename(item.value.path, complete_dir, item.value.path, io);
 
-    const note_file_path = item.value.noteFile(&buf);
+    const note_file_path = item.value.noteFile(buf);
     if (todo_dir.rename(note_file_path, complete_dir, note_file_path, io)) {} else |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
@@ -424,21 +502,20 @@ const UncompleteArgs = struct {
     pos: [1][]const u8,
 };
 
-fn cmdUncomplete(io: Io, args: WrapArgs(UncompleteArgs), config: *Config, todo_dir: Dir) !void {
+fn cmdUncomplete(io: Io, args: WrapArgs(UncompleteArgs), config: *Config, todo_dir: Dir, buf: []u8) !void {
     const name = args.posOrFatal(0, "name");
     const item = config.getItemOrFatal(name);
 
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    var buf: [2048]u8 = undefined;
-    const last_status = try item_file.getLastStatus(io, item.value, &buf);
+    const last_status = try item_file.getLastStatus(io, item.value, buf);
     if (last_status.status != .finishd) {
         std.log.err("{s} cannot be restarted if it is not completed", .{name});
         return;
     }
 
-    try item_file.addStatus(io, .restart, &buf);
+    try item_file.addStatus(io, .restart, buf);
 }
 
 const NotesArgs = struct {
@@ -477,10 +554,9 @@ fn cmdNotes(io: Io, args: WrapArgs(NotesArgs), config: Config, todo_dir: Dir, pa
     try stdout.flush();
 }
 
-fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir) !void {
+fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, stdout: *Io.Writer) !void {
     var buf: [2048]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &buf);
-    var stdout = Io.File.stdout().writer(io, &.{});
 
     const complete_dir = try todo_dir.openDir(io, "completed", .{ .iterate = true });
     defer complete_dir.close(io);
@@ -533,7 +609,7 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir) !
         const item_status = try item_file.getLastStatus(io, v, &buf);
 
         if (v.isInCompleted() and item_status.status != .finishd) {
-            try stdout.interface.print("item '{s}' is in completed/ but not marked as complete. You can: (s)et status as complete, (r)emove, (i)gnore, or (m)ove to uncompleted\n(s/r/i/m): ", .{v.name()});
+            try stdout.print("item '{s}' is in completed/ but not marked as complete. You can: (s)et status as complete, (r)emove, (i)gnore, or (m)ove to uncompleted\n(s/r/i/m): ", .{v.name()});
             try stdout.flush();
 
             const response = try stdin.interface.takeDelimiter('\n') orelse continue;
@@ -550,7 +626,7 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir) !
                 else => continue,
             }
         } else if (!v.isInCompleted() and item_status.status == .finishd) {
-            try stdout.interface.print("item '{s}' is in .todo/ but is marked as complete. You can: (s)et status as uncomplete, (r)emove, (i)gnore, or (m)ove to completed\n(s/r/i/m): ", .{v.name()});
+            try stdout.print("item '{s}' is in .todo/ but is marked as complete. You can: (s)et status as uncomplete, (r)emove, (i)gnore, or (m)ove to completed\n(s/r/i/m): ", .{v.name()});
             try stdout.flush();
 
             const response = try stdin.interface.takeDelimiter('\n') orelse continue;
@@ -723,7 +799,7 @@ const Config = struct {
 
             pub fn format(f: Formatter, w: *Io.Writer) !void {
                 if (f.all) {
-                    try w.print("\nstatus:  ({c}) {s}\nhash:    {s}\ndate:    {s}", .{
+                    try w.print("\nstatus:  ({c}) {s}\nhash:    {s}\nlatest:  {s}", .{
                         f.status_char,
                         f.item.name(),
                         f.key,
@@ -875,10 +951,11 @@ const Config = struct {
         };
     }
 
-    fn eqlLen(a: []const u8, b: []const u8) usize {
-        if (mem.eql(u8, a, b)) return a.len;
-        const min_len = @min(a.len, b.len);
-        if (!mem.eql(u8, a[0..min_len], b[0..min_len])) return 0;
+    fn eqlLen(haystack: []const u8, needle: []const u8) usize {
+        if (needle.len > haystack.len) return 0;
+        if (mem.eql(u8, haystack, needle)) return haystack.len;
+        const min_len = @min(haystack.len, needle.len);
+        if (!mem.eql(u8, haystack[0..min_len], needle[0..min_len])) return 0;
         return min_len;
     }
 
@@ -1090,6 +1167,12 @@ test "general" {
 
     try config.write(io, todo_dir);
 }
+
+const Shell = enum {
+    bash,
+    zsh,
+    fish,
+};
 
 const std = @import("std");
 const c = @import("c");
