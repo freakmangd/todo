@@ -12,12 +12,18 @@ pub fn build(b: *std.Build) void {
         ),
     });
 
+    const known_folders = b.dependency("known_folders", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("known-folders");
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
+    mod.addImport("known-folders", known_folders);
     mod.addImport("c", libc.createModule());
 
     const exe = b.addExecutable(.{

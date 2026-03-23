@@ -1,4 +1,9 @@
 const timestamp_format = "YYYY-MM-DD HH:mm:ss z";
+const config_file_path = "config.json";
+const todo_dir_path = ".todo";
+const todo_item_ext = ".todo";
+const note_file_ext = ".md";
+const completed_path = "completed";
 
 const Status = enum {
     created,
@@ -38,21 +43,21 @@ const Command = enum {
     n,
     repair,
 
+    set,
+
     install_completions,
     completions,
 };
 
 pub fn main(init: std.process.Init) if (@import("builtin").mode == .Debug) anyerror!void else void {
-    mainInner(init) catch |err| switch (err) {
-        error.CannotFindTodoDir => std.log.err("cannot find todo dir", .{}),
-        error.MalformedTodoDir => std.log.err("your todo dir is malformed", .{}),
-        else => |e| {
-            if (@import("builtin").mode == .Debug) {
-                return e;
-            } else {
-                std.log.err("{t}", .{e});
-            }
-        },
+    mainInner(init) catch |err| {
+        switch (err) {
+            error.CannotFindTodoDir => std.log.err("cannot find todo dir", .{}),
+            error.MalformedTodoDir => std.log.err("your .todo dir is malformed, try using 'repair'", .{}),
+            else => {},
+        }
+
+        return err;
     };
 }
 
@@ -66,37 +71,51 @@ pub fn mainInner(init: std.process.Init) !void {
     const exe_path = args_iter.next();
     _ = &exe_path;
 
+    var buf: [2048]u8 = undefined;
+    var stdout = Io.File.stdout().writer(io, &buf);
+
+    const term: Io.Terminal = .{
+        .writer = &stdout.interface,
+        .mode = try .detect(io, .stdout(), init.environ_map.contains("NO_COLOR"), init.environ_map.contains("CLICOLOR_FORCE")),
+    };
+
     const first_arg = args_iter.next() orelse arg: {
         // running without args
-        var todo_dir = findTodoDir(io, .{}) catch break :arg "help";
+        var todo_dir = findTodoDir(io, .{}) catch {
+            std.log.err("no .todo dir found", .{});
+            break :arg "help";
+        };
         defer todo_dir.close(io);
 
-        const config = try Config.read(arena, io, todo_dir);
-
-        var stdout_buf: [2048]u8 = undefined;
-        var stdout = Io.File.stdout().writer(io, &stdout_buf);
+        const config = try Config.read(arena, io, todo_dir, &buf);
 
         const args = try consumeArgs(&args_iter, ListArgs);
-        try cmdList(io, args, config, todo_dir, &stdout.interface);
+        try cmdList(io, args, config, todo_dir, term);
 
         return;
     };
 
-    const command = std.meta.stringToEnum(Command, first_arg) orelse {
-        stat_id: {
-            // try interpreting as an id and stat it
-            var todo_dir = findTodoDir(io, .{}) catch break :stat_id;
-            defer todo_dir.close(io);
+    const command = meta.stringToEnum(Command, first_arg) orelse unknown_command: {
+        // try interpreting as an id and stat it
+        var todo_dir = findTodoDir(io, .{}) catch break :unknown_command .help;
+        defer todo_dir.close(io);
 
-            const config = try Config.read(arena, io, todo_dir);
+        const config = try Config.read(arena, io, todo_dir, &buf);
 
-            var stdout_buf: [2048]u8 = undefined;
-            var stdout = Io.File.stdout().writer(io, &stdout_buf);
+        if (first_arg[0] == '-') {
+            // treat as args for ls
+            var args = try consumeArgs(&args_iter, ListArgs);
+            readTack(ListArgs, first_arg, &args.inner);
+            try cmdList(io, args, config, todo_dir, term);
+            return;
+        } else stat: {
+            // treat as `stat name`
+            _ = config.getItem(first_arg) orelse break :stat;
 
             var args = try consumeArgs(&args_iter, StatusArgs);
             args.inner.pos[0] = first_arg;
             args.args_len = 1;
-            try cmdStatus(io, args, config, todo_dir, &stdout.interface);
+            try cmdStatus(io, args, config, todo_dir, term);
             return;
         }
 
@@ -104,34 +123,36 @@ pub fn mainInner(init: std.process.Init) !void {
         return error.UnexpectedArgument;
     };
 
-    var buf: [2048]u8 = undefined;
-    var stdout = Io.File.stdout().writer(io, &buf);
-
     switch (command) {
         .help => {
             try stdout.interface.writeAll(
-                \\todo
-                \\  help                      show this dialogue
-                \\  init <name>               create a .todo dir in the current directory named <name>
-                \\  list, ls                  list todo items
-                \\                              -a    list all details
-                \\                              -h    list history
-                \\  repair                    try to repair .todo dir
+                \\tak
+                \\    help                        show this dialogue
+                \\    init <name>                 create a .todo dir in the current directory named <name>
+                \\    list, ls                    list todo items
+                \\                                  -a    list all details
+                \\                                  -d    list more details
+                \\                                  -h    list history
+                \\                                  -n    print notes
+                \\    repair                      try to repair .todo dir
                 \\
-                \\  add, a <name|id>          add a todo item
-                \\                              -m    add a message to the notes file
-                \\  remove, rm <name|id>      remove todo item
-                \\                              -y    don't ask for confirmation
-                \\  status, stat <name|id>    print the status of an item
-                \\                              -a    list all details
-                \\                              -h    list history
-                \\  start, on <name|id>       start working on a todo item
-                \\  stop, off <name|id>       stop working on a todo item
-                \\  complete, done <name|id>  complete a todo item
-                \\  uncomplete <name|id>      uncomplete a todo item
-                \\  notes, n <name|id>        print todo item's notes
-                \\                              -p    print the path to the notes file. 
-                \\                                    ex: `todo notes 9d -p | xargs nvim`
+                \\    add, a <name|id>            add a todo item
+                \\                                  -m    add a message to the notes file
+                \\    remove, rm <name|id>        remove todo item
+                \\                                  -y    don't ask for confirmation
+                \\    status, stat <name|id>      print the status of an item
+                \\                                  -a    list all details
+                \\                                  -d    list more details
+                \\                                  -h    list history
+                \\                                  -n    print notes
+                \\    start, on <name|id>         start working on a todo item
+                \\    stop, off <name|id>         stop working on a todo item
+                \\                                  -a    stop all items on current list
+                \\    complete, done <name|id>    complete a todo item
+                \\    uncomplete <name|id>        uncomplete a todo item
+                \\    notes, n <name|id>          print todo item's notes
+                \\                                  -p    print the path to the notes file. 
+                \\                                        ex: `todo notes 9d -p | xargs nvim`
                 \\
             );
             try stdout.flush();
@@ -139,26 +160,33 @@ pub fn mainInner(init: std.process.Init) !void {
         },
         .init => {
             const args = try consumeArgs(&args_iter, InitArgs);
-            try cmdInit(io, args, Dir.cwd());
+            try cmdInit(io, args, Dir.cwd(), &buf);
+            return;
+        },
+        .repair => {
+            //try cmdRepair(arena, io, &config, todo_dir, &stdout.interface);
             return;
         },
         else => {},
     }
 
-    var path: Io.Writer.Allocating = try .initCapacity(arena, 2);
+    var path: Io.Writer.Allocating = try .initCapacity(arena, ("\"" ++ todo_dir_path ++ "/\"").len);
     defer path.deinit();
 
-    try path.writer.writeAll("\"");
+    try path.writer.writeByte('"');
 
     var todo_dir = try findTodoDirWithPath(io, .{ .iterate = true }, &path.writer);
     defer todo_dir.close(io);
 
-    var config = try Config.read(arena, io, todo_dir);
+    var config = try Config.read(arena, io, todo_dir, &buf);
+
+    var user = User.init(arena, io, init.environ_map, todo_dir, &buf);
+    defer user.deinit(io);
 
     //std.debug.print("{f}\n", .{config});
 
     switch (command) {
-        .init, .help => unreachable,
+        .init, .help, .repair => unreachable,
         .add, .a => {
             var rand_bytes: [4]u8 = undefined;
             io.random(&rand_bytes);
@@ -173,11 +201,11 @@ pub fn mainInner(init: std.process.Init) !void {
         },
         .status, .stat => {
             const args = try consumeArgs(&args_iter, StatusArgs);
-            try cmdStatus(io, args, config, todo_dir, &stdout.interface);
+            try cmdStatus(io, args, config, todo_dir, term);
         },
         .list, .ls => {
             const args = try consumeArgs(&args_iter, ListArgs);
-            try cmdList(io, args, config, todo_dir, &stdout.interface);
+            try cmdList(io, args, config, todo_dir, term);
         },
         .start, .stop, .on, .off => {
             const com: Command = switch (command) {
@@ -198,16 +226,13 @@ pub fn mainInner(init: std.process.Init) !void {
         },
         .notes, .n => {
             const args = try consumeArgs(&args_iter, NotesArgs);
-            try cmdNotes(io, args, config, todo_dir, &path, &stdout.interface);
-        },
-        .repair => {
-            try cmdRepair(arena, io, &config, todo_dir, &stdout.interface);
+            try cmdNotes(io, args, config, todo_dir, &path, &stdout.interface, &buf);
         },
         .install_completions => {
             const args = try consumeArgs(&args_iter, struct {
                 pos: [1][]const u8,
             });
-            const shell = std.meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
+            const shell = meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
                 std.log.err("unsupported shell for completions :(", .{});
                 return error.UnsupportedShell;
             };
@@ -224,7 +249,7 @@ pub fn mainInner(init: std.process.Init) !void {
             const args = try consumeArgs(&args_iter, struct {
                 pos: [1][]const u8,
             });
-            const shell = std.meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
+            const shell = meta.stringToEnum(Shell, args.posOrFatal(0, "shell name")) orelse {
                 std.log.err("unsupported shell for completions :(", .{});
                 return error.UnsupportedShell;
             };
@@ -241,49 +266,65 @@ pub fn mainInner(init: std.process.Init) !void {
             try stdout.flush();
             return;
         },
+        .set => {
+            const args = try consumeArgs(&args_iter, struct {
+                pos: [2][]const u8,
+            });
+            const name = args.posOrFatal(0, "name");
+
+            const key = meta.stringToEnum(meta.FieldEnum(User.Data), name) orelse {
+                std.log.err("'{s}' is not an available value", .{name});
+                return error.UnknownUserConfigName;
+            };
+            switch (key) {
+                inline else => |k| {
+                    @field(user.data, @tagName(k)) = args.posOrFatal(1, "value");
+                },
+            }
+        },
     }
 
     // TODO: maybe only write if config is dirty?
     try config.write(io, todo_dir);
+    try user.write(
+        io,
+    );
 }
 
 const InitArgs = struct {
     pos: [1][]const u8,
 };
 
-fn cmdInit(io: Io, args: WrapArgs(InitArgs), cwd: Dir) !void {
+fn cmdInit(io: Io, args: WrapArgs(InitArgs), cwd: Dir, buf: []u8) !void {
     const name = args.posOrFatal(0, "name");
 
-    var todo_dir = try cwd.createDirPathOpen(io, ".todo", .{});
+    if (cwd.openDir(io, todo_dir_path, .{})) |dir| {
+        dir.close(io);
+        std.log.err("path already has a .todo dir", .{});
+        return;
+    } else |_| {}
+
+    var todo_dir = try cwd.createDirPathOpen(io, todo_dir_path, .{});
     defer todo_dir.close(io);
 
-    const config_file = try todo_dir.createFile(io, "config.json", .{});
+    const config_file = try todo_dir.createFile(io, config_file_path, .{});
     defer config_file.close(io);
 
-    var buf: [2048]u8 = undefined;
-    var fw = config_file.writer(io, &buf);
+    try Config.firstWrite(io, config_file, name, buf);
 
-    try fw.interface.print(
-        \\{{
-        \\    "name": "{s}",
-        \\    "items": {{}}
-        \\}}
-    , .{name});
-    try fw.interface.flush();
-
-    try todo_dir.createDir(io, "completed", .default_dir);
+    try todo_dir.createDir(io, completed_path, .default_dir);
 }
 
 const AddArgs = struct {
     pos: [1][]const u8,
-    m: ?[]const u8,
+    m: ?[]const u8 = null,
 };
 
 fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Config, todo_dir: Dir, key: [8]u8, buf: []u8) !void {
     const now: std.Io.Timestamp = .now(io, .real);
 
     const name = args.posOrFatal(0, "name");
-    const name_with_ext = try arena.dupe(u8, nameWithExt(name, ".todo", buf));
+    const name_with_ext = try arena.dupe(u8, nameWithExt(name, todo_item_ext, buf));
 
     try config.items.put(arena, key, .{ .path = name_with_ext });
 
@@ -298,12 +339,12 @@ fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Co
 
     {
         var fw = todo_file.writer(io, buf);
-        try fw.interface.print("{t}: {d}", .{ Status.created, now });
+        try fw.interface.print("{t} {d}", .{ Status.created, now });
         try fw.flush();
     }
 
     if (args.inner.m) |msg| {
-        const notes_path = nameWithExt(name, ".md", buf);
+        const notes_path = nameWithExt(name, note_file_ext, buf);
         var notes_file = try todo_dir.createFile(io, notes_path, .{});
         defer notes_file.close(io);
 
@@ -315,13 +356,13 @@ fn cmdAdd(arena: std.mem.Allocator, io: Io, args: WrapArgs(AddArgs), config: *Co
 
 const RemoveArgs = struct {
     pos: [1][]const u8,
-    y: bool,
+    y: bool = false,
 };
 
 fn cmdRemove(io: Io, args: WrapArgs(RemoveArgs), config: *Config, todo_dir: Dir, buf: []u8) !void {
     const name = args.posOrFatal(0, "name");
 
-    if (std.mem.eql(u8, name, "config.json")) {
+    if (std.mem.eql(u8, name, config_file_path)) {
         std.log.err("Cannot delete 'config.json'", .{});
         return error.IllegalDelete;
     }
@@ -350,12 +391,14 @@ fn cmdRemove(io: Io, args: WrapArgs(RemoveArgs), config: *Config, todo_dir: Dir,
 }
 
 const StatusArgs = struct {
-    a: bool,
-    h: bool,
     pos: [1][]const u8,
+    a: bool = false,
+    d: bool = false,
+    h: bool = false,
+    n: bool = false,
 };
 
-fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir, stdout: *Io.Writer) !void {
+fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir, term: Io.Terminal) !void {
     const name = args.posOrFatal(0, "name");
     const item = config.getItemOrFatal(name);
 
@@ -363,67 +406,81 @@ fn cmdStatus(io: Io, args: WrapArgs(StatusArgs), config: Config, todo_dir: Dir, 
     defer item_file.close(io);
 
     var read_buf: [2048]u8 = undefined;
-    const item_status = try item_file.getLastStatus(io, item.value, &read_buf);
 
-    try stdout.print(
-        \\on todo list {s}
-        \\{f}
-        \\
-    , .{ config.name, Config.Item.Formatter{
-        .all = args.inner.a,
-        .history = args.inner.h,
+    const note_file = item.value.openNoteFile(io, todo_dir, .{}, &read_buf);
+    defer note_file.close(io);
+
+    const item_status = try item_file.getStatus(io, item.value, &read_buf);
+
+    const fmt: Config.Item.Formatter = .{
+        .details = args.inner.a or args.inner.d,
+        .history = args.inner.a or args.inner.h,
+        .notes = args.inner.a or args.inner.n,
         .key = item.key,
         .item = item.value,
-        .status_char = item_status.status.char(),
-        .timestamp = item_status.timestamp,
-    } });
+        .item_status = item_status,
+        .notes_file = note_file,
+    };
 
-    if (args.inner.h) {
-        try item_file.formatItemStatus(io, stdout);
+    try term.writer.print(
+        \\on list {s}
+    , .{config.name});
+
+    try fmt.formatTerm(term);
+    try term.writer.writeByte('\n');
+
+    if (args.inner.a or args.inner.h) {
+        try item_file.formatItemStatus(io, term.writer);
     }
 
-    try stdout.flush();
+    try term.writer.flush();
 }
 
 const ListArgs = struct {
-    a: bool,
-    h: bool,
+    a: bool = false,
+    d: bool = false,
+    h: bool = false,
+    n: bool = false,
 };
 
-fn cmdList(io: Io, args: WrapArgs(ListArgs), config: Config, todo_dir: Dir, stdout: *Io.Writer) !void {
+fn cmdList(io: Io, args: WrapArgs(ListArgs), config: Config, todo_dir: Dir, term: Io.Terminal) !void {
     var buf: [2048]u8 = undefined;
 
-    try stdout.print("on todo list {s}\n", .{config.name});
+    try term.writer.print("on list {s}\n", .{config.name});
 
     for (config.items.keys(), config.items.values()) |k, v| {
         const item_file = try v.openFile(io, todo_dir, .{});
         defer item_file.close(io);
 
-        const item_status = item_file.getLastStatus(io, v, &buf) catch {
-            std.log.err("item '{s}'s corresponding file is missing", .{v.name()});
-            continue;
-        };
+        const note_file = v.openNoteFile(io, todo_dir, .{}, &buf);
+        defer note_file.close(io);
 
-        try stdout.print("{f}\n", .{Config.Item.Formatter{
-            .all = args.inner.a,
-            .history = args.inner.h,
+        const item_status = item_file.getStatus(io, v, &buf) catch continue;
+
+        const fmt: Config.Item.Formatter = .{
+            .details = args.inner.a or args.inner.d,
+            .history = args.inner.a or args.inner.h,
+            .notes = args.inner.a or args.inner.n,
             .key = k,
             .item = v,
-            .status_char = item_status.status.char(),
-            .timestamp = item_status.timestamp,
-        }});
+            .item_status = item_status,
+            .notes_file = note_file,
+        };
 
-        if (args.inner.h) {
-            try item_file.formatItemStatus(io, stdout);
+        try fmt.formatTerm(term);
+        try term.writer.writeAll("\n");
+
+        if (args.inner.a or args.inner.h) {
+            try item_file.formatItemStatus(io, term.writer);
         }
     }
 
-    try stdout.flush();
+    try term.writer.flush();
 }
 
 const StartStopArgs = struct {
     pos: [1][]const u8,
-    a: bool,
+    a: bool = false,
 };
 
 fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir: Dir, command: Command, buf: []u8) !void {
@@ -435,9 +492,9 @@ fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir:
 
         for (config.items.values()) |v| {
             var f = try v.openFile(io, todo_dir, .{ .mode = .read_write });
-            const last = f.getLastStatus(io, v, buf) catch continue;
+            const status = f.getStatus(io, v, buf) catch continue;
 
-            if (last.status == .started) {
+            if (status.latest.status == .started) {
                 try f.addStatus(io, .stopped, buf);
             }
         }
@@ -451,12 +508,12 @@ fn cmdStartStop(io: Io, args: WrapArgs(StartStopArgs), config: Config, todo_dir:
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    const last_status = try item_file.getLastStatus(io, item.value, buf);
-    if (last_status.status == .restart) {
+    const status = try item_file.getStatus(io, item.value, buf);
+    if (status.latest.status == .restart) {
         std.log.err("{s} is completed, use 'uncomplete' to allow the item to be started", .{name});
-    } else if (last_status.status == .started and command == .start) {
+    } else if (status.latest.status == .started and command == .start) {
         std.log.err("{s} is already started", .{name});
-    } else if (last_status.status != .started and command == .stop) {
+    } else if (status.latest.status != .started and command == .stop) {
         std.log.err("{s} is not started, it cannot be stopped", .{name});
     }
 
@@ -478,16 +535,16 @@ fn cmdComplete(arena: std.mem.Allocator, io: Io, args: WrapArgs(CompleteArgs), c
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    const last_status = try item_file.getLastStatus(io, item.value, buf);
-    if (last_status.status == .finishd) {
+    const status = try item_file.getStatus(io, item.value, buf);
+    if (status.latest.status == .finishd) {
         std.log.err("{s} is already completed", .{name});
     }
 
-    const complete_dir = try todo_dir.openDir(io, "completed", .{});
+    const complete_dir = try todo_dir.openDir(io, completed_path, .{});
     defer complete_dir.close(io);
 
     try item_file.addStatus(io, .finishd, buf);
-    try config.items.put(arena, item.key, .{ .path = try std.fmt.allocPrint(arena, "completed/{s}", .{item.value.path}) });
+    try config.items.put(arena, item.key, .{ .path = try std.fmt.allocPrint(arena, completed_path ++ "/{s}", .{item.value.path}) });
 
     try todo_dir.rename(item.value.path, complete_dir, item.value.path, io);
 
@@ -509,8 +566,8 @@ fn cmdUncomplete(io: Io, args: WrapArgs(UncompleteArgs), config: *Config, todo_d
     const item_file = try item.value.openFile(io, todo_dir, .{ .mode = .read_write });
     defer item_file.close(io);
 
-    const last_status = try item_file.getLastStatus(io, item.value, buf);
-    if (last_status.status != .finishd) {
+    const status = try item_file.getStatus(io, item.value, buf);
+    if (status.latest.status != .finishd) {
         std.log.err("{s} cannot be restarted if it is not completed", .{name});
         return;
     }
@@ -519,18 +576,17 @@ fn cmdUncomplete(io: Io, args: WrapArgs(UncompleteArgs), config: *Config, todo_d
 }
 
 const NotesArgs = struct {
-    p: bool,
     pos: [1][]const u8,
+    p: bool = false,
 };
 
-fn cmdNotes(io: Io, args: WrapArgs(NotesArgs), config: Config, todo_dir: Dir, path: ?*Io.Writer.Allocating, stdout: *Io.Writer) !void {
-    var buf: [2048]u8 = undefined;
+fn cmdNotes(io: Io, args: WrapArgs(NotesArgs), config: Config, todo_dir: Dir, path: ?*Io.Writer.Allocating, stdout: *Io.Writer, buf: []u8) !void {
     const item = config.getItemOrFatal(args.posOrFatal(0, "name"));
-    const name_with_ext = nameWithExt(item.value.withoutExt(), ".md", &buf);
+    const name_with_ext = nameWithExt(item.value.withoutExt(), note_file_ext, buf);
 
     if (args.inner.p) {
         try path.?.writer.writeAll(name_with_ext);
-        try path.?.writer.writeAll("\"");
+        try path.?.writer.writeByte('"');
 
         try stdout.writeAll(path.?.written());
         try stdout.flush();
@@ -538,10 +594,7 @@ fn cmdNotes(io: Io, args: WrapArgs(NotesArgs), config: Config, todo_dir: Dir, pa
     }
 
     const note_file = todo_dir.openFile(io, name_with_ext, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.debug.print("NO FILE NAMED {s}!!\n", .{name_with_ext});
-            return;
-        },
+        error.FileNotFound => return,
         else => |e| return e,
     };
     defer note_file.close(io);
@@ -554,12 +607,27 @@ fn cmdNotes(io: Io, args: WrapArgs(NotesArgs), config: Config, todo_dir: Dir, pa
     try stdout.flush();
 }
 
-fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, stdout: *Io.Writer) !void {
+fn cmdRepair(arena: std.mem.Allocator, io: Io, cwd: Dir, stdout: *Io.Writer) !void {
     var buf: [2048]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &buf);
 
-    const complete_dir = try todo_dir.openDir(io, "completed", .{ .iterate = true });
+    const todo_dir = try findTodoDir(io, cwd, .{});
+    defer todo_dir.close(io);
+
+    const complete_dir = try todo_dir.openDir(io, completed_path, .{ .iterate = true });
     defer complete_dir.close(io);
+
+    // missing config.json
+    const config = Config.read(arena, io, todo_dir, &buf) catch |err| if (err == error.NoConfigFile) {
+        const config_file = try todo_dir.createFile(io, config_file_path, .{});
+        defer config_file.close(io);
+
+        try stdout.print("missing a config.json file, would you like to create one?\n(y)es/(a)bort:", .{});
+        try stdout.flush();
+
+        const name = try arena.dupe(u8, try stdin.interface.takeDelimiter('\n') orelse return);
+        try Config.firstWrite(io, config_file, name, buf);
+    } else return err;
 
     // items without corresponding files
     item_loop: for (config.items.keys(), config.items.values()) |k, v| {
@@ -567,7 +635,7 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
             error.FileNotFound => {
                 var todo_iter = todo_dir.iterate();
                 while (try todo_iter.next(io)) |file| {
-                    if (file.kind != .file or !mem.endsWith(u8, file.name, ".todo")) continue;
+                    if (file.kind != .file or !mem.endsWith(u8, file.name, todo_item_ext)) continue;
 
                     const name = Config.Item.name(.{ .path = file.name });
                     if (mem.eql(u8, name, v.name())) {
@@ -579,11 +647,11 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
 
                 var completed_iter = complete_dir.iterate();
                 while (try completed_iter.next(io)) |file| {
-                    if (file.kind != .file or !mem.endsWith(u8, file.name, ".todo")) continue;
+                    if (file.kind != .file or !mem.endsWith(u8, file.name, todo_item_ext)) continue;
 
                     const name = Config.Item.name(.{ .path = file.name });
                     if (mem.eql(u8, name, v.name())) {
-                        try config.items.put(arena, k, .{ .path = try std.fmt.allocPrint(arena, "completed/{s}", .{file.name}) });
+                        try config.items.put(arena, k, .{ .path = try std.fmt.allocPrint(arena, completed_path ++ "/{s}", .{file.name}) });
                         std.log.info("found corresponding file for {s} in completed/", .{v.name()});
                         continue :item_loop;
                     }
@@ -606,9 +674,9 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
         const item_file = try v.openFile(io, todo_dir, .{ .mode = .read_write });
         defer item_file.close(io);
 
-        const item_status = try item_file.getLastStatus(io, v, &buf);
+        const item_status = try item_file.getStatus(io, v, &buf);
 
-        if (v.isInCompleted() and item_status.status != .finishd) {
+        if (v.isInCompleted() and item_status.latest.status != .finishd) {
             try stdout.print("item '{s}' is in completed/ but not marked as complete. You can: (s)et status as complete, (r)emove, (i)gnore, or (m)ove to uncompleted\n(s/r/i/m): ", .{v.name()});
             try stdout.flush();
 
@@ -625,7 +693,7 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
                 },
                 else => continue,
             }
-        } else if (!v.isInCompleted() and item_status.status == .finishd) {
+        } else if (!v.isInCompleted() and item_status.latest.status == .finishd) {
             try stdout.print("item '{s}' is in .todo/ but is marked as complete. You can: (s)et status as uncomplete, (r)emove, (i)gnore, or (m)ove to completed\n(s/r/i/m): ", .{v.name()});
             try stdout.flush();
 
@@ -638,7 +706,7 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
                 },
                 'm' => {
                     try todo_dir.rename(v.path, complete_dir, v.path, io);
-                    try config.items.put(arena, k, .{ .path = try std.fmt.allocPrint(arena, "completed/{s}", .{v.path}) });
+                    try config.items.put(arena, k, .{ .path = try std.fmt.allocPrint(arena, completed_path ++ "/{s}", .{v.path}) });
                 },
                 else => continue,
             }
@@ -649,18 +717,20 @@ fn cmdRepair(arena: std.mem.Allocator, io: Io, config: *Config, todo_dir: Dir, s
     // TODO
 }
 
-fn findTodoDir(io: std.Io, open_dir_options: Dir.OpenOptions) !Dir {
+fn findTodoDir(io: std.Io, cwd: Dir, open_dir_options: Dir.OpenOptions) !Dir {
     var dcw = Io.Writer.Discarding.init(&.{});
-    return findTodoDirWithPath(io, open_dir_options, &dcw.writer);
+    return findTodoDirWithPath(io, cwd, open_dir_options, &dcw.writer);
 }
 
-fn findTodoDirWithPath(io: std.Io, open_dir_options: Dir.OpenOptions, path_writer: *Io.Writer) !Dir {
+fn findTodoDirWithPath(io: std.Io, cwd: Dir, open_dir_options: Dir.OpenOptions, path_writer: *Io.Writer) !Dir {
     var depth: usize = 0;
-    var cur = try Dir.cwd().openDir(io, ".", .{});
+    const max_depth = 10;
+
+    var cur = try cwd.openDir(io, ".", .{});
 
     const todo_dir: Dir = while (true) {
-        const todo_dir = cur.openDir(io, ".todo", open_dir_options) catch {
-            if (depth == 10) return error.CannotFindTodoDir;
+        const todo_dir = cur.openDir(io, todo_dir_path, open_dir_options) catch {
+            if (depth >= max_depth) return error.CannotFindTodoDir;
 
             const parent = cur.openDir(io, "..", .{}) catch return error.CannotFindTodoDir;
             cur.close(io);
@@ -673,11 +743,11 @@ fn findTodoDirWithPath(io: std.Io, open_dir_options: Dir.OpenOptions, path_write
         };
 
         cur.close(io);
-        try path_writer.writeAll(".todo/");
+        try path_writer.writeAll(todo_dir_path ++ "/");
         break todo_dir;
     };
 
-    if (todo_dir.access(io, "config.json", .{})) |_| {} else |_| {
+    if (todo_dir.access(io, config_file_path, .{})) |_| {} else |_| {
         return error.MalformedTodoDir;
     }
 
@@ -696,31 +766,54 @@ const Config = struct {
         const Key = [8]u8;
 
         fn name(item: Item) []const u8 {
-            const start_idx = if (item.isInCompleted()) "completed/".len else 0;
-            return item.path[start_idx .. item.path.len - ".todo".len];
+            const file_name = item.filename();
+            return file_name[0 .. file_name.len - todo_item_ext.len];
         }
 
         fn filename(item: Item) []const u8 {
-            const start_idx = if (item.isInCompleted()) "completed/".len else 0;
+            const start_idx = if (item.isInCompleted()) (completed_path ++ "/").len else 0;
             return item.path[start_idx..];
         }
 
         fn isInCompleted(item: Item) bool {
-            return mem.startsWith(u8, item.path, "completed/");
+            return mem.startsWith(u8, item.path, completed_path ++ "/");
         }
 
         fn withoutExt(item: Item) []const u8 {
-            return item.path[0 .. item.path.len - ".todo".len];
+            return item.path[0 .. item.path.len - todo_item_ext.len];
         }
 
         fn openFile(item: Item, io: Io, todo_dir: Dir, options: Io.File.OpenFlags) !File {
             return .{ .inner = try todo_dir.openFile(io, item.path, options) };
         }
 
+        fn openNoteFile(item: Item, io: Io, todo_dir: Dir, options: Io.File.OpenFlags, buf: []u8) MaybeNoteFile {
+            const note_path = item.noteFile(buf);
+            return .{
+                .io = io,
+                .buf = buf,
+                .inner = todo_dir.openFile(io, note_path, options) catch null,
+            };
+        }
+
+        const MaybeNoteFile = struct {
+            io: Io,
+            buf: []u8,
+            inner: ?Io.File,
+
+            fn close(f: MaybeNoteFile, io: Io) void {
+                if (f.inner) |inner| inner.close(io);
+            }
+
+            fn reader(f: MaybeNoteFile) ?Io.File.Reader {
+                return if (f.inner) |inner| inner.reader(f.io, f.buf) else null;
+            }
+        };
+
         fn noteFile(item: Item, out_buf: []u8) []const u8 {
             const nwe = item.withoutExt();
             @memcpy(out_buf[0..nwe.len], nwe);
-            @memcpy(out_buf[nwe.len..][0..3], ".md");
+            @memcpy(out_buf[nwe.len..][0..3], note_file_ext);
             return out_buf[0 .. nwe.len + 3];
         }
 
@@ -736,17 +829,60 @@ const Config = struct {
 
                 var td_writer = file.inner.writer(io, buf);
                 try td_writer.seekTo(try file.inner.length(io));
-                try td_writer.interface.print("\n{t}: {}", .{ status, now.nanoseconds });
+                try td_writer.interface.print("\n{t} {}", .{ status, now.nanoseconds });
                 try td_writer.interface.flush();
             }
 
-            fn getLastStatus(file: File, io: Io, item: Item, buf: []u8) !struct {
+            const StatusLine = struct {
                 status: Status,
-                timestamp: []const u8,
-            } {
+                timestamp: ?[]const u8,
+                author_name: ?[]const u8,
+                author_email: ?[]const u8,
+                format_mode: enum {
+                    simple,
+                    detailed,
+                } = .simple,
+
+                fn read(line: []const u8) !StatusLine {
+                    var iter: SpaceQuoteIter = .init(line);
+
+                    const status_str = iter.next() orelse return error.EmptyStatusLine;
+                    const status = meta.stringToEnum(Status, status_str) orelse return error.UnknownStatusForTodoItem;
+
+                    const timestamp = iter.next();
+                    const author_name = iter.next();
+                    const author_email = iter.next();
+
+                    return .{
+                        .status = status,
+                        .timestamp = timestamp,
+                        .author_name = author_name,
+                        .author_email = author_email,
+                    };
+                }
+            };
+
+            const FirstLatestStatus = struct {
+                first: StatusLine,
+                latest: StatusLine,
+            };
+
+            fn getStatus(file: File, io: Io, item: Item, buf: []u8) !FirstLatestStatus {
                 var reader = file.inner.reader(io, buf);
 
-                var last_line_maybe: ?[]const u8 = null;
+                var first_status: StatusLine = undefined;
+                const first_line_maybe = try reader.interface.takeDelimiter('\n');
+                if (first_line_maybe) |first_line| {
+                    first_status = StatusLine.read(first_line) catch |err| {
+                        std.log.err("malformed todo item: {s}", .{item.name()});
+
+                        var sl_iter = mem.splitScalar(u8, first_line, ' ');
+                        if (sl_iter.next()) |status_str| std.log.err("found '{s}' as status", .{status_str});
+                        return err;
+                    };
+                }
+
+                var last_line_maybe: ?[]const u8 = first_line_maybe;
                 while (try reader.interface.takeDelimiter('\n')) |line| {
                     if (line.len == 0) continue;
                     last_line_maybe = line;
@@ -757,21 +893,17 @@ const Config = struct {
                     return error.TodoItemEmpty;
                 };
 
-                const colon_idx = std.mem.indexOfScalar(u8, last_line, ':') orelse {
-                    std.log.err("malformed todo item: {s}, found {s} as latest status", .{ item.name(), last_line });
-                    return error.MalformedTodoItem;
-                };
-                const status_word = last_line[0..colon_idx];
-                const timestamp_str = last_line[colon_idx + 2 ..];
+                const latest_status = StatusLine.read(last_line) catch |err| {
+                    std.log.err("malformed todo item: {s}", .{item.name()});
 
-                const status = std.meta.stringToEnum(Status, status_word) orelse {
-                    std.log.err("malformed todo item: {s}, found {s} as status", .{ item.name(), status_word });
-                    return error.UnknownStatusForTodoItem;
+                    var sl_iter = mem.splitScalar(u8, last_line, ' ');
+                    if (sl_iter.next()) |status_str| std.log.err("found '{s}' as status", .{status_str});
+                    return err;
                 };
 
                 return .{
-                    .status = status,
-                    .timestamp = timestamp_str,
+                    .first = first_status,
+                    .latest = latest_status,
                 };
             }
 
@@ -779,40 +911,84 @@ const Config = struct {
                 var read_buf: [2048]u8 = undefined;
                 var reader = file.inner.reader(io, &read_buf);
 
-                try w.writeAll("=================================\n");
+                try w.writeAll("================================\n");
                 while (try reader.interface.takeDelimiter('\n')) |line| {
-                    var space_iter = mem.splitScalar(u8, line, ' ');
-                    const status_str = space_iter.next().?;
-                    const timestamp = space_iter.next().?;
-                    try w.print("{s} {s}\n", .{ status_str, try Formatter.formatTimestamp(timestamp) });
+                    const status_line = StatusLine.read(line) catch return error.WriteFailed;
+                    try w.print("{t} {s}\n", .{
+                        status_line.status,
+                        try Formatter.formatTimestamp(status_line.timestamp),
+                    });
                 }
             }
         };
 
         const Formatter = struct {
-            all: bool,
+            details: bool,
             history: bool,
+            notes: bool,
+
             item: Item,
             key: Key,
-            status_char: u8,
-            timestamp: []const u8,
+            item_status: Item.File.FirstLatestStatus,
+            notes_file: MaybeNoteFile,
 
-            pub fn format(f: Formatter, w: *Io.Writer) !void {
-                if (f.all) {
-                    try w.print("\nstatus:  ({c}) {s}\nhash:    {s}\nlatest:  {s}", .{
-                        f.status_char,
+            pub fn formatTerm(f: Formatter, term: Io.Terminal) !void {
+                if (f.details) {
+                    const first_has_email = f.item_status.first.author_email != null;
+                    const latest_has_email = f.item_status.latest.author_email != null;
+
+                    try term.setColor(.bright_yellow);
+                    try term.writer.print("\nstatus:  ({c}) {s}\n", .{
+                        f.item_status.latest.status.char(),
                         f.item.name(),
-                        f.key,
-                        try formatTimestamp(f.timestamp),
                     });
-                } else if (f.history) {
-                    try w.print("\n[{s}] ({c}) {s}", .{ f.key, f.status_char, f.item.name() });
+
+                    try term.setColor(.white);
+
+                    if (f.item_status.first.author_name != null or f.item_status.first.author_email != null) {
+                        try term.writer.print("author:  {s} {s}{s}{s}\n", .{
+                            f.item_status.first.author_name orelse "",
+                            if (first_has_email) "<" else "",
+                            f.item_status.first.author_email orelse "",
+                            if (first_has_email) ">" else "",
+                        });
+                    }
+
+                    try term.writer.print(
+                        \\hash:    {s}
+                        \\latest:  {s}{s}{s} {s}{s}{s}
+                    , .{
+                        f.key,
+                        try formatTimestamp(f.item_status.latest.timestamp),
+                        author_str: {
+                            if (f.item_status.latest.author_name != null or f.item_status.latest.author_email != null) {
+                                break :author_str "\n         ";
+                            } else {
+                                break :author_str "";
+                            }
+                        },
+                        f.item_status.latest.author_name orelse "",
+                        if (latest_has_email) "<" else "",
+                        f.item_status.latest.author_email orelse "",
+                        if (latest_has_email) ">" else "",
+                    });
+                } else if (f.history or f.notes) {
+                    try term.writer.print("\n[{s}] ({c}) {s}", .{ f.key, f.item_status.latest.status.char(), f.item.name() });
                 } else {
-                    try w.print("    [{s}] ({c}) {s}", .{ f.key, f.status_char, f.item.name() });
+                    try term.writer.print("    [{s}] ({c}) {s}", .{ f.key, f.item_status.latest.status.char(), f.item.name() });
+                }
+
+                if (f.notes) write_notes: {
+                    var nfr = f.notes_file.reader() orelse break :write_notes;
+
+                    try term.writer.writeAll("\n\n");
+                    _ = nfr.interface.streamRemaining(term.writer) catch return error.WriteFailed;
+                    try term.writer.writeByte('\n');
                 }
             }
 
-            fn formatTimestamp(ts_raw_str: []const u8) ![]const u8 {
+            fn formatTimestamp(ts_raw_str_maybe: ?[]const u8) ![]const u8 {
+                const ts_raw_str = ts_raw_str_maybe orelse return "??? ??? ?? ??:??:?? ????";
                 const ts_int = std.fmt.parseInt(u64, ts_raw_str, 10) catch return error.WriteFailed;
                 const ts: Io.Timestamp = .{ .nanoseconds = ts_int };
                 const ts_sec = ts.toSeconds();
@@ -823,13 +999,12 @@ const Config = struct {
         };
     };
 
-    fn write(config: *Config, io: Io, todo_dir: Dir) !void {
-        var config_file = try todo_dir.createFile(io, "config.json", .{});
+    fn write(config: Config, io: Io, todo_dir: Dir) !void {
+        var config_file = try todo_dir.createFile(io, config_file_path, .{});
         defer config_file.close(io);
 
         var writer = config_file.writer(io, &.{});
-
-        try std.json.Stringify.value(config.*, .{}, &writer.interface);
+        try std.json.Stringify.value(config, .{}, &writer.interface);
     }
 
     fn deinit(config: *Config, gpa: std.mem.Allocator) void {
@@ -839,12 +1014,14 @@ const Config = struct {
         config.items.deinit(gpa);
     }
 
-    fn read(gpa: std.mem.Allocator, io: Io, todo_dir: Dir) !Config {
-        var config_file = try todo_dir.openFile(io, "config.json", .{});
+    fn read(gpa: std.mem.Allocator, io: Io, todo_dir: Dir, buf: []u8) !Config {
+        var config_file = todo_dir.openFile(io, config_file_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.NoConfigFile,
+            else => |e| return e,
+        };
         defer config_file.close(io);
 
-        var buf: [2048]u8 = undefined;
-        var config_reader = config_file.reader(io, &buf);
+        var config_reader = config_file.reader(io, buf);
 
         var config_js = std.json.Reader.init(gpa, &config_reader.interface);
 
@@ -963,6 +1140,17 @@ const Config = struct {
         return try (config.getItem(id_or_name) orelse return error.ItemNotFound).open(io, todo_dir);
     }
 
+    fn firstWrite(io: Io, config_file: Io.File, name: []const u8, buf: []u8) void {
+        var fw = config_file.writer(io, buf);
+        try fw.interface.print(
+            \\{{
+            \\    "name": "{s}",
+            \\    "items": {{}}
+            \\}}
+        , .{name});
+        try fw.interface.flush();
+    }
+
     pub fn format(config: Config, w: *Io.Writer) !void {
         try w.print(
             \\{{
@@ -980,6 +1168,78 @@ const Config = struct {
             \\    }
             \\}
         );
+    }
+};
+
+const User = struct {
+    file: ?Io.File,
+    data: Data,
+
+    const user_file_path = "user.json";
+
+    const Data = struct {
+        name: []const u8,
+        email: []const u8,
+    };
+
+    fn init(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, todo_dir: Io.Dir, buf: []u8) User {
+        return initInner(gpa, io, env, todo_dir, buf) catch .{
+            .file = null,
+            .data = .{
+                .name = "",
+                .email = "",
+            },
+        };
+    }
+
+    fn initInner(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, todo_dir: Io.Dir, buf: []u8) !User {
+        const user_file = user_file: {
+            if (todo_dir.openFile(io, user_file_path, .{})) |file| {
+                break :user_file file;
+            } else |_| {}
+
+            if (kf.open(io, gpa, env.*, .home, .{})) |home_dir_maybe| home_dir: {
+                const home_dir = home_dir_maybe orelse break :home_dir;
+                defer home_dir.close(io);
+
+                const user_file = home_dir.openFile(io, user_file_path, .{}) catch break :home_dir;
+                break :user_file user_file;
+            } else |_| {}
+
+            return error.NoUserFile;
+        };
+
+        return read(gpa, io, user_file, buf);
+    }
+
+    fn deinit(u: User, io: Io) void {
+        if (u.file) |file| file.close(io);
+    }
+
+    fn read(gpa: std.mem.Allocator, io: Io, user_file: Io.File, buf: []u8) !User {
+        var user_reader = user_file.reader(io, buf);
+
+        var user_js = std.json.Reader.init(gpa, &user_reader.interface);
+
+        var diag: std.json.Diagnostics = .{};
+        user_js.scanner.enableDiagnostics(&diag);
+        errdefer {
+            std.log.err("json error: {}:{}:{}", .{ diag.getLine(), diag.getColumn(), diag.getByteOffset() });
+        }
+
+        const data = try std.json.parseFromTokenSourceLeaky(Data, gpa, &user_js, .{});
+
+        return .{
+            .file = user_file,
+            .data = data,
+        };
+    }
+
+    fn write(user: User, io: Io) !void {
+        const file = user.file orelse return;
+        var writer = file.writer(io, &.{});
+        try std.json.Stringify.value(user, .{}, &writer.interface);
+        try writer.end();
     }
 };
 
@@ -1039,54 +1299,131 @@ fn consumeArgs(args_iter: *std.process.Args.Iterator, Args: type) !WrapArgs(Args
     var args: WrapArgs(Args) = .empty;
 
     arg_loop: while (args_iter.next()) |arg| {
-        inline for (@typeInfo(Args).@"struct".fields) |f| {
-            if (arg[0] != '-') {
-                if (@hasField(Args, "pos")) {
-                    if (args.args_len >= args.inner.pos.len) {
-                        std.log.err("too many positional arguments", .{});
-                        return error.TooManyArgs;
-                    }
-
-                    args.inner.pos[args.args_len] = arg;
-                    args.args_len += 1;
-                    continue :arg_loop;
-                } else {
-                    std.log.err("positional arguments not expected", .{});
-                    return error.PositionalArgument;
+        if (arg[0] != '-') {
+            if (@hasField(Args, "pos")) {
+                if (args.args_len >= args.inner.pos.len) {
+                    std.log.err("too many positional arguments", .{});
+                    return error.TooManyArgs;
                 }
-            } else if (mem.eql(u8, f.name, arg[1..])) {
-                if (f.type == bool) {
-                    @field(args.inner, f.name) = true;
-                } else if (f.type == []const u8 or f.type == ?[]const u8) {
-                    if (!mem.endsWith(u8, arg, "=")) {
-                        @field(args.inner, f.name) = args_iter.next() orelse {
-                            std.log.err("argument '{s}' expected a value", .{f.name});
-                            return error.NamedArgWithoutValue;
-                        };
-                        continue :arg_loop;
-                    }
 
-                    // expecting -arg_name=...
-                    if (arg.len < f.name.len + 2) {
-                        std.log.err("argument '{s}' malformed", .{f.name});
-                        return error.MalformedArgument;
-                    }
-
-                    @field(args.inner, f.name) = arg[f.name.len + 2 ..];
-                }
+                args.inner.pos[args.args_len] = arg;
+                args.args_len += 1;
                 continue :arg_loop;
-            } else if (arg[0] == '-' and f.type == bool) {
-                for (arg[1..]) |flag_char| {
-                    if (mem.eql(u8, f.name, &.{flag_char})) {
-                        @field(args.inner, f.name) = true;
-                    }
-                }
+            } else {
+                std.log.err("positional arguments not expected", .{});
+                return error.PositionalArgument;
             }
+
+            // matching either -arg "abc" or -arg="abc"
+        } else if (meta.stringToEnum(meta.FieldEnum(Args), arg[1 .. mem.indexOfScalar(u8, arg[1..], '=') orelse arg.len])) |field| {
+            switch (field) {
+                inline else => |field_name_tag| {
+                    if (@hasField(Args, "pos") and field_name_tag == .pos) {
+                        std.log.err("'pos' is not a valid argument name", .{});
+                        return error.UnknownArgument;
+                    }
+
+                    const field_name = @tagName(field_name_tag);
+                    const F = @FieldType(Args, field_name);
+
+                    if (F == bool) {
+                        @field(args.inner, field_name) = true;
+                    } else if (F == []const u8 or F == ?[]const u8) {
+                        if (!mem.endsWith(u8, arg, "=")) {
+                            @field(args.inner, field_name) = args_iter.next() orelse {
+                                std.log.err("argument '{s}' expected a value", .{field_name});
+                                return error.NamedArgWithoutValue;
+                            };
+                            continue :arg_loop;
+                        }
+
+                        // expecting -arg_name=...
+                        if (arg.len < field_name.len + 2) {
+                            std.log.err("argument '{s}' malformed", .{field_name});
+                            return error.MalformedArgument;
+                        }
+
+                        @field(args.inner, field_name) = arg[field_name.len + 2 ..];
+                    }
+                    continue :arg_loop;
+                },
+            }
+        } else {
+            readTack(Args, arg, &args.inner);
         }
     }
 
     return args;
 }
+
+fn readTack(Args: type, arg_str: []const u8, args: *Args) void {
+    inline for (@typeInfo(Args).@"struct".fields) |f| {
+        if (f.type == bool and arg_str[0] == '-') {
+            for (arg_str[1..]) |flag_char| {
+                if (mem.eql(u8, f.name, &.{flag_char})) {
+                    @field(args, f.name) = true;
+                }
+            }
+        }
+    }
+}
+
+const SpaceQuoteIter = struct {
+    str: []const u8,
+    idx: usize,
+
+    fn init(str: []const u8) SpaceQuoteIter {
+        return .{
+            .str = str,
+            .idx = 0,
+        };
+    }
+
+    fn next(iter: *SpaceQuoteIter) ?[]const u8 {
+        if (iter.idx >= iter.str.len) return null;
+        var space_iter = mem.splitScalar(u8, iter.str[iter.idx..], ' ');
+
+        var word = space_iter.next() orelse return null;
+        if (word.len == 0 or word[0] != '"') {
+            iter.idx += word.len + 1;
+            return word;
+        }
+
+        if (word[0] == '"' and word[word.len - 1] == '"') {
+            iter.idx += word.len + 1;
+            return word[1 .. word.len - 1];
+        }
+
+        var len = word.len;
+        while (word[0] == '"') {
+            word = space_iter.next() orelse break;
+            len += word.len;
+        }
+
+        defer iter.idx += len + 2;
+        return iter.str[iter.idx + 1 ..][0 .. len - 1];
+    }
+};
+
+test SpaceQuoteIter {
+    var iter: SpaceQuoteIter = .init("a \"b c\" d e  f \"gh\" i \"jk\"");
+
+    try std.testing.expectEqualStrings("a", iter.next().?);
+    try std.testing.expectEqualStrings("b c", iter.next().?);
+    try std.testing.expectEqualStrings("d", iter.next().?);
+    try std.testing.expectEqualStrings("e", iter.next().?);
+    try std.testing.expectEqualStrings("", iter.next().?);
+    try std.testing.expectEqualStrings("f", iter.next().?);
+    try std.testing.expectEqualStrings("gh", iter.next().?);
+    try std.testing.expectEqualStrings("i", iter.next().?);
+    try std.testing.expectEqualStrings("jk", iter.next().?);
+}
+
+const Shell = enum {
+    bash,
+    zsh,
+    fish,
+};
 
 test "general" {
     const gpa = std.testing.allocator;
@@ -1103,48 +1440,50 @@ test "general" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    try cmdInit(io, .initStatic(.{ .pos = .{"test"} }), temp_dir.dir);
+    var buf: [2048]u8 = undefined;
 
-    var todo_dir = try temp_dir.dir.openDir(io, ".todo", .{});
+    try cmdInit(io, .initStatic(.{ .pos = .{"test"} }), temp_dir.dir, &buf);
+
+    var todo_dir = try temp_dir.dir.openDir(io, todo_dir_path, .{});
     defer todo_dir.close(io);
 
-    var config: Config = try .read(arena, io, todo_dir);
+    var config: Config = try .read(arena, io, todo_dir, &buf);
 
-    try cmdAdd(arena, io, .initStatic(.{ .pos = .{"item-1"}, .m = null }), &config, todo_dir, "a1b2c3d4".*);
-    try cmdAdd(arena, io, .initStatic(.{ .pos = .{"item-2"}, .m = "item-2 notes" }), &config, todo_dir, "e5f6g7h8".*);
+    try cmdAdd(arena, io, .initStatic(.{ .pos = .{"item-1"} }), &config, todo_dir, "a1b2c3d4".*, &buf);
+    try cmdAdd(arena, io, .initStatic(.{ .pos = .{"item-2"}, .m = "item-2 notes" }), &config, todo_dir, "e5f6g7h8".*, &buf);
     try cmdList(io, .empty, config, todo_dir, &stdout.writer);
 
     try std.testing.expectEqualStrings(
-        \\on todo list test
+        \\on list test
         \\    [a1b2c3d4] ( ) item-1
         \\    [e5f6g7h8] ( ) item-2
         \\
     , stdout.written());
     stdout.writer.end = 0;
 
-    try cmdStartStop(io, .initStatic(.{ .pos = .{"item-1"} }), config, todo_dir, .start);
+    try cmdStartStop(io, .initStatic(.{ .pos = .{"item-1"} }), config, todo_dir, .start, &buf);
     try cmdList(io, .empty, config, todo_dir, &stdout.writer);
 
     try std.testing.expectEqualStrings(
-        \\on todo list test
+        \\on list test
         \\    [a1b2c3d4] (o) item-1
         \\    [e5f6g7h8] ( ) item-2
         \\
     , stdout.written());
     stdout.writer.end = 0;
 
-    try cmdComplete(arena, io, .initStatic(.{ .pos = .{"e5"} }), &config, todo_dir);
+    try cmdComplete(arena, io, .initStatic(.{ .pos = .{"e5"} }), &config, todo_dir, &buf);
     try cmdList(io, .empty, config, todo_dir, &stdout.writer);
 
     try std.testing.expectEqualStrings(
-        \\on todo list test
+        \\on list test
         \\    [a1b2c3d4] (o) item-1
         \\    [e5f6g7h8] (x) item-2
         \\
     , stdout.written());
     stdout.writer.end = 0;
 
-    try cmdNotes(io, .initStatic(.{ .pos = .{"e5"}, .p = false }), config, todo_dir, null, &stdout.writer);
+    try cmdNotes(io, .initStatic(.{ .pos = .{"e5"} }), config, todo_dir, null, &stdout.writer, &buf);
 
     try std.testing.expectEqualStrings(
         \\item-2 notes
@@ -1152,31 +1491,27 @@ test "general" {
     , stdout.written());
     stdout.writer.end = 0;
 
-    try cmdUncomplete(io, .initStatic(.{ .pos = .{"e5"} }), &config, todo_dir);
+    try cmdUncomplete(io, .initStatic(.{ .pos = .{"e5"} }), &config, todo_dir, &buf);
     try cmdList(io, .empty, config, todo_dir, &stdout.writer);
 
     try std.testing.expectEqualStrings(
-        \\on todo list test
+        \\on list test
         \\    [a1b2c3d4] (o) item-1
         \\    [e5f6g7h8] ( ) item-2
         \\
     , stdout.written());
     stdout.writer.end = 0;
 
-    try cmdRemove(io, .initStatic(.{ .pos = .{"a1"}, .y = true }), &config, todo_dir);
+    try cmdRemove(io, .initStatic(.{ .pos = .{"a1"}, .y = true }), &config, todo_dir, &buf);
 
     try config.write(io, todo_dir);
 }
 
-const Shell = enum {
-    bash,
-    zsh,
-    fish,
-};
-
 const std = @import("std");
 const c = @import("c");
+const kf = @import("known-folders");
 const mem = std.mem;
+const meta = std.meta;
 const Io = std.Io;
 const Dir = Io.Dir;
 const Map = std.AutoArrayHashMapUnmanaged;

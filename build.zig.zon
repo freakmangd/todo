@@ -1,7 +1,12 @@
 .{
     .name = .todo,
     .version = "0.0.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders#d002ad87b1f8c238eb080c185bb0b93cfd946b9d",
+            .hash = "known_folders-0.0.0-Fy-PJiXKAACLbIUjxVqJRTSLc6HNnMkCSBnC5LW0Lx_v",
+        },
+    },
     .minimum_zig_version = "0.15.2",
     .paths = .{""},
     .fingerprint = 0x5a0eb6a039c11be7,
